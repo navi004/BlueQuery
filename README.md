@@ -1,6 +1,6 @@
-# BlueQuery 
+# BlueQuery
 
-Backend logic and codes for the **BlueQuery SIH2026** project — an intelligent oceanographic data assistant powered by AI agents.
+Backend logic and code for the **BlueQuery SIH2026** project — an intelligent oceanographic data assistant powered by AI agents.
 
 ## 📋 Overview
 
@@ -13,34 +13,297 @@ BlueQuery is a sophisticated system designed to process oceanographic queries ab
 - **Data Visualization**: Support for chart generation and data summarization
 - **Safety Guardrails**: Built-in prompt validation and unsafe input detection
 
+---
+
+## 🗂️ Data Source
+
+**Argo Float Program — Global Ocean Observation Network**
+
+The Argo program operates a global array of ~4,000 autonomous profiling floats that measure temperature, salinity, and pressure throughout the world's oceans. Data is freely available via the [Argo Data Management](https://argo.ucsd.edu/data/) portal.
+
+### Index Catalog Files
+
+The Argo system provides global index catalog files that act as a data discovery layer — listing all available NetCDF profile files without requiring full dataset downloads.
+
+| File | Description |
+|------|-------------|
+| `ar_index_global_meta.txt.gz` | Float metadata catalog |
+| `ar_index_global_prof.txt.gz` | Profile measurement index |
+| `ar_index_global_traj.txt.gz` | Float trajectory index |
+| `ar_index_global_tech.txt.gz` | Technical parameter index |
+| `argo_bio_profile_index.txt` | Biogeochemical profile index |
+| `argo_synthetic_profile_index.txt` | Synthetic profile index |
+
+Each row in these files describes a single NetCDF file with fields: `file`, `date`, `latitude`, `longitude`, `ocean`, `profiler_type`, `institution`, `date_update`.
+
+---
+
+## 🔧 Data Pipeline
+
+The data pipeline transforms raw Argo scientific data into a structured SQLite database ready for AI-powered querying.
+
+### Pipeline Overview
+
+```
+Argo Index Catalogs (.txt.gz)
+        │
+        ▼
+1. Decompression & Parsing
+        │
+        ▼
+2. Normalization & Feature Engineering
+        │
+        ▼
+3. Subsetting Strategy (DAC + Cycle filter)
+        │
+        ▼
+4. NetCDF File Acquisition
+        │
+        ▼
+5. NetCDF Flattening → Relational Tables
+        │
+        ▼
+SQLite Database (argo_db.db)
+        │
+        ▼
+MCP Adapter → AI Agent → FastAPI → Frontend
+```
+
+---
+
+### Stage 1 — Decompression & Parsing
+
+Index files are provided as `.txt.gz` compressed archives. The pipeline decompresses them, skips metadata comment lines (prefixed with `#`), and parses them into DataFrames.
+
+```python
+import gzip
+import pandas as pd
+
+with gzip.open("ar_index_global_prof.txt.gz", "rt") as f:
+    lines = [l for l in f if not l.startswith("#")]
+
+df = pd.read_csv(pd.io.common.StringIO("".join(lines)))
+```
+
+Output: DataFrame with millions of rows, 8–12 columns per index file.
+
+---
+
+### Stage 2 — Normalization & Feature Engineering
+
+**Timestamp normalization:**
+```python
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+df["date_update"] = pd.to_datetime(df["date_update"], errors="coerce")
+```
+
+**Metadata extraction from file path:**
+
+The `file` column encodes hidden structure not available as separate columns. For example:
+```
+incois/3901702/profiles/R3901702_015.nc
+```
+
+Extracted fields:
+
+| Derived Feature | Extracted Value | Meaning |
+|-----------------|-----------------|---------|
+| `dac` | `incois` | Data Assembly Center |
+| `float_id` | `3901702` | Unique float identifier |
+| `profile_type` | `R` | Real-time (R) or Delayed (D) mode |
+| `cycle_number` | `15` | Profile cycle number |
+
+```python
+import re
+
+df["dac"] = df["file"].apply(lambda x: x.split("/")[0])
+df["float_id"] = df["file"].apply(lambda x: x.split("/")[1])
+df["profile_type"] = df["file"].apply(lambda x: x.split("/")[-1][0])
+df["cycle_number"] = df["file"].apply(
+    lambda x: int(re.search(r"_(\d+)\.nc$", x).group(1))
+)
+```
+
+---
+
+### Stage 3 — Subsetting Strategy
+
+The global Argo dataset contains 4M+ profiles across TB-scale data. Two filters were applied to produce a manageable, scientifically coherent subset.
+
+**Filter 1 — DAC Selection (INCOIS)**
+
+INCOIS (Indian National Centre for Ocean Information Services) manages floats deployed primarily in the Indian Ocean, providing a regionally coherent dataset.
+
+```python
+df_subset = df[df["dac"] == "incois"]
+```
+
+**Filter 2 — Cycle Limitation**
+
+Each float can produce 200–400 cycles. Cycles 1–50 were retained to capture the launch and early operational phases while keeping storage manageable.
+
+```python
+df_subset = df_subset[
+    (df_subset["cycle_number"] >= 1) &
+    (df_subset["cycle_number"] <= 50)
+]
+```
+
+Result: DAC-specific index files — `meta_incois.csv`, `prof_incois.csv`, `traj_incois.csv`, `tech_incois.csv` — reducing millions of rows to thousands.
+
+---
+
+### Stage 4 — NetCDF File Acquisition
+
+Using the filtered `file` column, download URLs are reconstructed and files are downloaded preserving the original directory hierarchy.
+
+```python
+BASE_URL = "https://data-argo.ifremer.fr/dac/"
+
+for file_path in df_subset["file"]:
+    url = BASE_URL + file_path
+    local_path = f"subset_dac_downloads/{file_path}"
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    # download and save
+```
+
+Local structure preserved:
+```
+subset_dac_downloads/
+└── incois/
+    └── 3901702/
+        └── profiles/
+            ├── R3901702_001.nc
+            ├── R3901702_002.nc
+            └── ...
+```
+
+---
+
+### Stage 5 — NetCDF Flattening
+
+NetCDF files contain multi-dimensional arrays. For example, temperature is stored as:
+
+```
+TEMP(N_PROF, N_LEVELS)  →  e.g., TEMP[0, 0..119]  (120 depth levels)
+```
+
+This must be converted to relational rows for SQL storage.
+
+```python
+import xarray as xr
+
+ds = xr.open_dataset("R3901702_015.nc")
+df = ds.to_dataframe().reset_index()
+```
+
+**Before flattening (NetCDF):**
+```
+TEMP[profile=0, level=0] = 28.2
+TEMP[profile=0, level=1] = 27.9
+...
+```
+
+**After flattening (SQL-ready):**
+
+| platform | cycle | pressure | temperature | salinity |
+|----------|-------|----------|-------------|----------|
+| 3901702  | 15    | 10.0     | 28.2        | 35.1     |
+| 3901702  | 15    | 20.0     | 27.9        | 35.2     |
+| 3901702  | 15    | 30.0     | 27.6        | 35.3     |
+
+Each depth level becomes one row, preserving full scientific precision.
+
+---
+
+## 🗄️ Database Schema
+
+The pipeline produces a structured SQLite database (`argo_db.db`) with four relational tables.
+
+### `meta_rel` — Float Metadata
+One row per float.
+
+| Column | Description |
+|--------|-------------|
+| `PLATFORM_NUMBER` | Unique float identifier |
+| `PLATFORM_TYPE` | Hardware type/model |
+| `PLATFORM_FAMILY` | Float family classification |
+| `PLATFORM_MAKER` | Manufacturer |
+| `PROJECT_NAME` | Deployment project name |
+| `PI_NAME` | Principal Investigator |
+| `LAUNCH_DATE` | Deployment date |
+| `LAUNCH_LATITUDE` | Deployment latitude |
+| `LAUNCH_LONGITUDE` | Deployment longitude |
+
+### `traj_rel` — Float Trajectory
+One row per trajectory observation.
+
+| Column | Description |
+|--------|-------------|
+| `PLATFORM_NUMBER` | Float identifier |
+| `LATITUDE` | Observed latitude |
+| `LONGITUDE` | Observed longitude |
+| `JULD` | Julian date timestamp |
+| `CYCLE_NUMBER` | Profile cycle |
+| `POSITION_QC` | Position quality flag |
+| `DATA_MODE` | Real-time or delayed mode |
+
+### `prof_rel` — Profile Measurements
+One row per depth level measurement.
+
+| Column | Description |
+|--------|-------------|
+| `PLATFORM_NUMBER` | Float identifier |
+| `CYCLE_NUMBER` | Profile cycle |
+| `PRES` | Pressure (dbar) |
+| `TEMP` | Temperature (°C) |
+| `PSAL` | Salinity (PSU) |
+| `PRES_QC` | Pressure quality flag |
+| `TEMP_QC` | Temperature quality flag |
+| `PSAL_QC` | Salinity quality flag |
+
+### `tech_rel` — Technical Parameters
+One row per technical metadata entry.
+
+| Column | Description |
+|--------|-------------|
+| `PLATFORM_NUMBER` | Float identifier |
+| `TECHNICAL_PARAMETER_NAME` | Parameter name |
+| `TECHNICAL_PARAMETER_VALUE` | Parameter value |
+| `CYCLE_NUMBER` | Associated cycle |
+
+---
+
 ## 🏗️ Architecture
 
 ### Core Components
 
 #### 1. **Agent-Based Pipeline** (`dev_notebooks/devsan.py`)
-   - **Prompt Guard Agent**: Validates user queries for safety and relevance
-   - **Query Processor Agent**: Interprets queries and fetches/analyzes ARGO data
-   - **Output Formatter Agent**: Formats responses as clean, Markdown-structured output
+- **Prompt Guard Agent**: Validates user queries for safety and relevance
+- **Query Processor Agent**: Interprets queries and fetches/analyzes ARGO data
+- **Output Formatter Agent**: Formats responses as clean, Markdown-structured output
 
 #### 2. **Voice Input System** (`dev_notebooks/devsan-2.py`)
-   - Records audio from microphone
-   - Transcribes using Google Gemini API
-   - Feeds transcript into the agent pipeline
+- Records audio from microphone
+- Transcribes using Google Gemini API
+- Feeds transcript into the agent pipeline
 
 #### 3. **MCP Integration** (`dev_notebooks/devsan-mcp.py`)
-   - Model Context Protocol (MCP) adapter for SQLite database
-   - Executes SQL queries against ARGO float database
-   - Supports schema-aware data retrieval
+- Model Context Protocol (MCP) adapter for SQLite database
+- Executes SQL queries against ARGO float database
+- Supports schema-aware data retrieval
 
 #### 4. **Visualization Module** (`dev_notebooks/devsan-viz.py`)
-   - Generates charts using `@antv/mcp-server-chart`
-   - Visualizes oceanographic data (salinity profiles, trajectories, etc.)
+- Generates charts using `@antv/mcp-server-chart`
+- Visualizes oceanographic data (salinity profiles, trajectories, etc.)
 
 #### 5. **FastAPI Server** (`main.py`, `main2.py`, `main3.py`, `main4.py`, `main5.py`)
-   - REST API endpoint: `POST /query`
-   - Persistent MCP connection (main2.py)
-   - Request caching and rate limiting
-   - Configurable database paths and timeouts
+- REST API endpoint: `POST /query`
+- Persistent MCP connection (main2.py)
+- Request caching and rate limiting
+- Configurable database paths and timeouts
+
+---
 
 ## 📁 Project Structure
 
@@ -58,42 +321,20 @@ BlueQuery-backend/
 ├── main3.py                   # FastAPI variant (no formatter)
 ├── main4.py                   # FastAPI with schema details
 ├── main5.py                   # FastAPI with logging suppression
+├── data/
+│   ├── sample_argo_dataset.xlsx   # Sample float data
+│   └── incois_5floats_combined.xlsx  # Processed INCOIS subset
 ├── tests/
-│   ├── fapi-test.py          # FastAPI test
+│   ├── fapi-test.py           # FastAPI test
 │   ├── gemini_voice_test.py   # Gemini transcription test
-│   ├── voiceInputTest.py      # Whisper transcription test
-│   └── file.md                # Sample output
-├── ARGO_DATA/                 # ARGO dataset directory
+│   └── voiceInputTest.py      # Whisper transcription test
+├── ARGO_DATA/                 # Raw index and NetCDF files
 ├── database/                  # SQLite database files
 ├── pyproject.toml             # Project dependencies
-└── README.md                  # This file
+└── README.md
 ```
 
-## 🗄️ Database Schema
-
-The ARGO database includes the following tables:
-
-### `meta_rel` — Metadata
-- Platform information (number, type, family, maker)
-- Project and PI details
-- Sensor and parameter specifications
-- Deployment and launch information
-
-### `traj_rel` — Trajectory
-- Position data (latitude, longitude, JULD timestamp)
-- Positioning system and data state indicators
-- Quality control flags and accuracy metrics
-- Cycle numbers and data modes
-
-### `prof_rel` — Profiles
-- Profile measurements (pressure, temperature, salinity)
-- Quality control and adjusted values
-- Platform type and cycle information
-
-### `tech_rel` — Technical Parameters
-- Technical metadata and versions
-- Handbook information
-- Parameter specifications and updates
+---
 
 ## 🚀 Quick Start
 
@@ -101,51 +342,36 @@ The ARGO database includes the following tables:
 
 - Python 3.11+
 - [Node.js](https://nodejs.org/) (for MCP server: `@executeautomation/database-server`)
-- [Google Gemini API Key](https://aistudio.google.com/) (for voice/transcription)
+- [Google Gemini API Key](https://aistudio.google.com/)
 - SQLite database file with ARGO data
 
 ### Installation
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/YasirAhmadX/BlueQuery-backend.git
-   cd BlueQuery-backend
-   ```
+```bash
+git clone https://github.com/navi004/BlueQuery-backend.git
+cd BlueQuery-backend
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-2. **Create a virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+### Environment Variables
 
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   # Or use: pip install -e .
-   ```
-
-4. **Set environment variables**
-   ```bash
-   export GEMINI_API_KEY="your-api-key-here"
-   export ARGO_DB_PATH="/path/to/argo_database.db"
-   ```
+```bash
+export GEMINI_API_KEY="your-api-key-here"
+export ARGO_DB_PATH="/path/to/argo_database.db"
+```
 
 ### Running the Application
 
-#### Option 1: Interactive CLI
 ```bash
+# Interactive CLI
 python dev_notebooks/devsan.py
-# or with voice input:
-python dev_notebooks/devsan-2.py
-```
 
-#### Option 2: FastAPI Server
-```bash
+# FastAPI Server
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
 
-#### Option 3: MCP-Enhanced Server
-```bash
+# MCP-Enhanced Server
 uvicorn main2:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -167,9 +393,9 @@ curl -X POST http://localhost:8000/query \
 }
 ```
 
-## 🔧 Configuration
+---
 
-### Environment Variables
+## 🔧 Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -180,19 +406,7 @@ curl -X POST http://localhost:8000/query \
 | `REQUEST_TIMEOUT_SECONDS` | `180` | Request processing timeout |
 | `THREAD_POOL_WORKERS` | `4` | Thread pool size |
 
-### LLM Configuration
-
-**Default Model**: `gemini/gemini-2.5-flash`
-
-To use a local model (Ollama):
-```python
-llm = LLM(
-    model="ollama/qwen2.5:0.5b",
-    temperature=0.7,
-    api_base="http://localhost:11434",
-    api_key="dummy"
-)
-```
+---
 
 ## 📦 Dependencies
 
@@ -201,11 +415,15 @@ crewai[tools]>=0.193.2
 python-dotenv>=1.1.1
 fastapi
 uvicorn
-google-genai (for Gemini transcription)
-sounddevice (for voice recording)
-soundfile (for WAV file handling)
+xarray
+netCDF4
+google-genai
+sounddevice
+soundfile
 whisper (optional, for local transcription)
 ```
+
+---
 
 ## 🔐 Safety & Guardrails
 
@@ -214,35 +432,23 @@ whisper (optional, for local transcription)
 - **Structured Output**: Markdown formatting with clear sections
 - **Rate Limiting**: Semaphore-based concurrency control
 
-## 🎯 Features
-
-✅ **Multi-agent orchestration** with sequential task execution  
-✅ **Voice input** with Gemini transcription  
-✅ **Database querying** via MCP SQLite adapter  
-✅ **Data visualization** support  
-✅ **REST API** for frontend integration  
-✅ **Persistent connections** for production use  
-✅ **Request caching** for performance  
-✅ **Configurable LLMs** (Gemini, Ollama, etc.)  
+---
 
 ## 🧪 Testing
 
-Run unit tests:
 ```bash
 pytest tests/ -v
-```
-
-Test voice transcription:
-```bash
 python tests/gemini_voice_test.py
-# or
-python tests/voiceInputTest.py
-```
-
-Test FastAPI endpoint:
-```bash
 python tests/fapi-test.py
 ```
+
+---
+
+## 🎓 Project Context
+
+**BlueQuery** is part of the **Smart India Hackathon 2025/2026** initiative (Semi-finalist), focusing on making oceanographic data accessible through AI-powered conversational interfaces. The project addresses the challenge of querying complex scientific NetCDF data without domain expertise, enabling researchers, students, and policymakers to interact with Argo float data using plain language.
+
+---
 
 ## 📝 License
 
@@ -270,10 +476,7 @@ For questions or issues, please:
 
 ---
 
-**Last Updated**: February 2026  
-**Maintainer**: [YasirAhmadX](https://github.com/YasirAhmadX)
-
-
+**Last Updated**: March 2026  
 ---
 
 ## 📌 Key Highlights of This README
@@ -288,5 +491,6 @@ For questions or issues, please:
 8. **Safety Features**: Highlights guardrails
 9. **Testing**: Instructions for running tests
 10. **Context**: Mentions the SIH2026 hackathon
+
 
 
