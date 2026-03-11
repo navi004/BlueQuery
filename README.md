@@ -21,6 +21,8 @@ BlueQuery is a sophisticated system designed to process oceanographic queries ab
 
 The Argo program operates a global array of ~4,000 autonomous profiling floats that measure temperature, salinity, and pressure throughout the world's oceans. Data is freely available via the [Argo Data Management](https://argo.ucsd.edu/data/) portal.
 
+> **Note**: Due to file size constraints, `incois_floats_combined.xlsx` contains a representative sample of the processed INCOIS subset. The full dataset was used during development and model training.
+
 ### Index Catalog Files
 
 The Argo system provides global index catalog files that act as a data discovery layer — listing all available NetCDF profile files without requiring full dataset downloads.
@@ -35,6 +37,16 @@ The Argo system provides global index catalog files that act as a data discovery
 | `argo_synthetic_profile_index.txt` | Synthetic profile index |
 
 Each row in these files describes a single NetCDF file with fields: `file`, `date`, `latitude`, `longitude`, `ocean`, `profiler_type`, `institution`, `date_update`.
+
+## 📓 Notebooks
+
+| Notebook | Description |
+|----------|-------------|
+| `DATA.ipynb` | Initial data pipeline — Argo index parsing, timestamp normalization, metadata feature engineering |
+| `DATA_updated.ipynb` | Refined pipeline — INCOIS subsetting, NetCDF file acquisition, xarray flattening to relational tables |
+| `SIH_DATA_RETRIEVAL.ipynb` | SIH-specific retrieval pipeline — DAC filtering, cycle limiting, SQLite database generation for deployment |
+
+These notebooks document the full data engineering workflow from raw Argo catalogs to the structured SQLite database used by the AI agent backend.
 
 ---
 
@@ -322,13 +334,18 @@ BlueQuery-backend/
 ├── main4.py                   # FastAPI with schema details
 ├── main5.py                   # FastAPI with logging suppression
 ├── data/
-│   ├── sample_argo_dataset.xlsx   # Sample float data
-│   └── incois_5floats_combined.xlsx  # Processed INCOIS subset
+│   ├── sample_argo_dataset.xlsx      # Sample float data
+│   ├── incois_floats_combined.xlsx   # Processed INCOIS subset (sample)
+│   └── R1902671_072.nc               # Sample raw NetCDF file
 ├── tests/
 │   ├── fapi-test.py           # FastAPI test
 │   ├── gemini_voice_test.py   # Gemini transcription test
 │   └── voiceInputTest.py      # Whisper transcription test
 ├── ARGO_DATA/                 # Raw index and NetCDF files
+├── notebooks/
+│   ├── DATA.ipynb                 # Initial data pipeline — index parsing, normalization, feature engineering
+│   ├── DATA_updated.ipynb         # Refined pipeline — subsetting, NetCDF acquisition, flattening to relational tables
+│   └── SIH_DATA_RETRIEVAL.ipynb  # SIH-specific data retrieval — DAC filtering, SQLite database generation
 ├── database/                  # SQLite database files
 ├── pyproject.toml             # Project dependencies
 └── README.md
@@ -491,6 +508,7 @@ For questions or issues, please:
 8. **Safety Features**: Highlights guardrails
 9. **Testing**: Instructions for running tests
 10. **Context**: Mentions the SIH2026 hackathon
+
 
 
 
